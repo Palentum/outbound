@@ -15,6 +15,7 @@ import (
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/transport/grpc"
 	"github.com/daeuniverse/outbound/transport/httpupgrade"
+	"github.com/daeuniverse/outbound/transport/jls"
 	"github.com/daeuniverse/outbound/transport/ws"
 )
 
@@ -35,6 +36,9 @@ type Trojan struct {
 	Path          string `json:"path"`
 	ServiceName   string `json:"serviceName"`
 	AllowInsecure bool   `json:"allowInsecure"`
+	Security      string `json:"security"`
+	JlsUsername   string `json:"jlsUsername"`
+	JlsPassword   string `json:"jlsPassword"`
 	Protocol      string `json:"protocol"`
 }
 
@@ -49,7 +53,28 @@ func NewTrojan(option *dialer.ExtraOption, nextDialer netproxy.Dialer, link stri
 func (s *Trojan) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (netproxy.Dialer, *dialer.Property, error) {
 	d := nextDialer
 	var err error
-	if s.Type != "grpc" {
+	if s.Security == "jls" {
+		if s.Type == "grpc" {
+			// grpc builds its own TLS layer, which jls cannot replace.
+			return nil, nil, fmt.Errorf("%w: jls over grpc", dialer.UnexpectedFieldErr)
+		}
+		query := url.Values{
+			"username": []string{s.JlsUsername},
+			"password": []string{s.JlsPassword},
+		}
+		common.SetValue(&query, "sni", s.Sni)
+		if s.Type == "ws" || s.Type == "httpupgrade" {
+			query.Set("alpn", "http/1.1")
+		}
+		u := url.URL{
+			Scheme:   "jls",
+			Host:     net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+			RawQuery: query.Encode(),
+		}
+		if d, _, err = jls.NewJLS(option, d, u.String()); err != nil {
+			return nil, nil, err
+		}
+	} else if s.Type != "grpc" {
 		// grpc contains tls
 		u := url.URL{
 			Scheme: option.TlsImplementation,
@@ -156,6 +181,11 @@ func ParseTrojanURL(u string) (data *Trojan, err error) {
 		AllowInsecure: allowInsecure,
 		Protocol:      "trojan",
 	}
+	if t.Query().Get("security") == "jls" {
+		data.Security = "jls"
+		data.JlsUsername = t.Query().Get("jls-username")
+		data.JlsPassword = t.Query().Get("jls-password")
+	}
 	if t.Query().Get("type") != "" {
 		t.Scheme = "trojan-go"
 	}
@@ -185,6 +215,9 @@ func (t *Trojan) ExportToURL() string {
 		q.Set("allowInsecure", "1")
 	}
 	common.SetValue(&q, "sni", t.Sni)
+	common.SetValue(&q, "security", t.Security)
+	common.SetValue(&q, "jls-username", t.JlsUsername)
+	common.SetValue(&q, "jls-password", t.JlsPassword)
 
 	if t.Protocol == "trojan-go" {
 		u.Scheme = "trojan-go"

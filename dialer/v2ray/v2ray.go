@@ -19,6 +19,7 @@ import (
 	"github.com/daeuniverse/outbound/transport/grpc"
 	"github.com/daeuniverse/outbound/transport/httpheader"
 	"github.com/daeuniverse/outbound/transport/httpupgrade"
+	"github.com/daeuniverse/outbound/transport/jls"
 	"github.com/daeuniverse/outbound/transport/meek"
 	"github.com/daeuniverse/outbound/transport/tls"
 	"github.com/daeuniverse/outbound/transport/ws"
@@ -49,6 +50,8 @@ type V2Ray struct {
 	PublicKey     string `json:"pbk,omitempty"`
 	ShortId       string `json:"sid,omitempty"`
 	SpiderX       string `json:"spx,omitempty"`
+	JlsUsername   string `json:"jls-username,omitempty"`
+	JlsPassword   string `json:"jls-password,omitempty"`
 	V             string `json:"v"`
 	Protocol      string `json:"protocol"`
 }
@@ -142,6 +145,13 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 			return nil, nil, fmt.Errorf("only VLESS supports reality")
 		}
 	}
+	if s.TLS == "jls" {
+		switch strings.ToLower(s.Net) {
+		case "tcp", "ws", "httpupgrade":
+		default:
+			return nil, nil, fmt.Errorf("%w: jls over %v", dialer.UnexpectedFieldErr, s.Net)
+		}
+	}
 
 	switch strings.ToLower(s.Net) {
 	case "ws":
@@ -152,6 +162,13 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 		sni := s.SNI
 		if sni == "" {
 			sni = s.Host
+		}
+		if s.TLS == "jls" {
+			// JLS secures the stream beneath a plain ws; websocket needs
+			// http/1.1, which mihomo forces as well.
+			if d, err = s.jlsDialer(option, d, "http/1.1"); err != nil {
+				return nil, nil, err
+			}
 		}
 		u := url.URL{
 			Scheme: scheme,
@@ -168,12 +185,14 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 			return nil, nil, err
 		}
 	case "tcp":
-		if s.TLS == "tls" || s.TLS == "reality" {
+		if s.TLS == "tls" || s.TLS == "reality" || s.TLS == "jls" {
 			sni := s.SNI
 			if sni == "" {
 				sni = s.Host
 			}
-			if s.TLS == "reality" {
+			if s.TLS == "jls" {
+				d, err = s.jlsDialer(option, d, s.Alpn)
+			} else if s.TLS == "reality" {
 				u := url.URL{
 					Scheme: "reality",
 					Host:   net.JoinHostPort(s.Add, s.Port),
@@ -280,6 +299,11 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 		if s.TLS == "tls" {
 			scheme = "https"
 		}
+		if s.TLS == "jls" {
+			if d, err = s.jlsDialer(option, d, "http/1.1"); err != nil {
+				return nil, nil, err
+			}
+		}
 		u := url.URL{
 			Scheme: scheme,
 			Host:   net.JoinHostPort(s.Add, s.Port),
@@ -316,6 +340,29 @@ func (s *V2Ray) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dialer) (
 	}, nil
 }
 
+// jlsDialer puts a JLS layer in place of TLS. Without sni and host, jls falls
+// back to the server address as its server name.
+func (s *V2Ray) jlsDialer(option *dialer.ExtraOption, d netproxy.Dialer, alpn string) (netproxy.Dialer, error) {
+	sni := s.SNI
+	if sni == "" {
+		sni = s.Host
+	}
+	query := url.Values{
+		"username": []string{s.JlsUsername},
+		"password": []string{s.JlsPassword},
+	}
+	common.SetValue(&query, "sni", sni)
+	common.SetValue(&query, "alpn", alpn)
+	common.SetValue(&query, "fp", s.Fingerprint)
+	u := url.URL{
+		Scheme:   "jls",
+		Host:     net.JoinHostPort(s.Add, s.Port),
+		RawQuery: query.Encode(),
+	}
+	d, _, err := jls.NewJLS(option, d, u.String())
+	return d, err
+}
+
 func ParseVlessURL(vless string) (data *V2Ray, err error) {
 	u, err := url.Parse(vless)
 	if err != nil {
@@ -339,6 +386,8 @@ func ParseVlessURL(vless string) (data *V2Ray, err error) {
 		PublicKey:     u.Query().Get("pbk"),
 		ShortId:       u.Query().Get("sid"),
 		SpiderX:       u.Query().Get("spx"),
+		JlsUsername:   u.Query().Get("jls-username"),
+		JlsPassword:   u.Query().Get("jls-password"),
 		V:             "2",
 		Protocol:      "vless",
 	}
@@ -476,6 +525,8 @@ func (s *V2Ray) ExportToURL() string {
 			common.SetValue(&query, "alpn", s.Alpn)
 			common.SetValue(&query, "flow", s.Flow)
 			common.SetValue(&query, "fp", s.Fingerprint)
+			common.SetValue(&query, "jls-username", s.JlsUsername)
+			common.SetValue(&query, "jls-password", s.JlsPassword)
 		}
 
 		U := url.URL{

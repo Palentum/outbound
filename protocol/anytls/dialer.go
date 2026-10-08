@@ -188,45 +188,55 @@ func (d *Dialer) getSession(ctx context.Context, tcpNetwork string) (*session, e
 		return nil, fmt.Errorf("anytls requires net.Conn, got %T", rawConn)
 	}
 
-	// Coalesce TLS records: crypto/tls issues one socket write per record;
-	// the coalescer batches the records of one write burst into one write.
-	coConn := coalesce.New(conn)
-	tlsConn := tls.Client(coConn, d.tlsConfig)
-	if err := netproxy.HandshakeWithContext(ctx, tlsConn); err != nil {
-		_ = tlsConn.Close()
-		return nil, err
-	}
-	// The TLS handshake writes through the coalescer; drain it so the
-	// handshake bytes actually leave before the authentication packet.
-	if err := coConn.Flush(); err != nil {
-		_ = tlsConn.Close()
-		return nil, err
+	// A nil tlsConfig means the next dialer (JLS) already secures the
+	// connection and flushes every write itself. The session then writes to
+	// it directly: a coalescer above that layer would merge the padded writes
+	// of a burst into one record and erase the padding scheme's record sizes.
+	sessionConn := conn
+	var sessionFlusher flusher
+	if d.tlsConfig != nil {
+		// Coalesce TLS records: crypto/tls issues one socket write per record;
+		// the coalescer batches the records of one write burst into one write.
+		coConn := coalesce.New(conn)
+		tlsConn := tls.Client(coConn, d.tlsConfig)
+		if err := netproxy.HandshakeWithContext(ctx, tlsConn); err != nil {
+			_ = tlsConn.Close()
+			return nil, err
+		}
+		// The TLS handshake writes through the coalescer; drain it so the
+		// handshake bytes actually leave before the authentication packet.
+		if err := coConn.Flush(); err != nil {
+			_ = tlsConn.Close()
+			return nil, err
+		}
+		sessionConn = tlsConn
+		sessionFlusher = coConn
 	}
 
 	buf, err := buildAuthenticationPacket(d.key, d.padding.Load())
 	if err != nil {
-		_ = tlsConn.Close()
+		_ = sessionConn.Close()
 		return nil, err
 	}
 	defer pool.Put(buf)
-	restoreDeadline, err := netproxy.ApplyConnDeadlineFromContext(ctx, tlsConn)
+	restoreDeadline, err := netproxy.ApplyConnDeadlineFromContext(ctx, sessionConn)
 	if err != nil {
-		_ = tlsConn.Close()
+		_ = sessionConn.Close()
 		return nil, err
 	}
 	defer restoreDeadline()
-	if _, err := tlsConn.Write(buf); err != nil {
-		_ = tlsConn.Close()
+	if _, err := sessionConn.Write(buf); err != nil {
+		_ = sessionConn.Close()
 		return nil, err
 	}
 
 	// The session read loop owns this buffer and releases it only after its
 	// final Read returns. Creating it after authentication avoids failure-path
 	// allocations for sessions that are never published.
-	bufferedConn := bufferred_conn.NewBufferedConnSize(tlsConn, sessionReadBufferSize)
+	bufferedConn := bufferred_conn.NewBufferedConnSize(sessionConn, sessionReadBufferSize)
 	seq := d.sessionCounter.Add(1)
 	s := newSessionWithPadding(bufferedConn, seq, &d.padding)
-	s.flusher = coConn
+	s.flusher = sessionFlusher
 	d.idleSessionLock.Lock()
 	if d.closed {
 		d.idleSessionLock.Unlock()

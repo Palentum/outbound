@@ -12,6 +12,7 @@ import (
 	"github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
+	"github.com/daeuniverse/outbound/transport/jls"
 	"github.com/daeuniverse/outbound/transport/mux"
 	"github.com/daeuniverse/outbound/transport/shadowtls"
 	"github.com/daeuniverse/outbound/transport/simpleobfs"
@@ -134,6 +135,25 @@ func (s *Shadowsocks) Dialer(option *dialer.ExtraOption, nextDialer netproxy.Dia
 		}
 		uShadowTLS.RawQuery = query.Encode()
 		if d, _, err = shadowtls.NewShadowTLS(option, d, uShadowTLS.String()); err != nil {
+			return nil, nil, err
+		}
+	case "jls":
+		query := url.Values{
+			"username": []string{s.Plugin.Opts.Username},
+			"password": []string{s.Plugin.Opts.Password},
+		}
+		sni := s.Plugin.Opts.SNI
+		if sni == "" {
+			sni = s.Plugin.Opts.Host
+		}
+		common.SetValue(&query, "sni", sni)
+		common.SetValue(&query, "alpn", s.Plugin.Opts.Alpn)
+		uJLS := url.URL{
+			Scheme:   "jls",
+			Host:     net.JoinHostPort(s.Server, strconv.Itoa(s.Port)),
+			RawQuery: query.Encode(),
+		}
+		if d, _, err = jls.NewJLS(option, d, uJLS.String()); err != nil {
 			return nil, nil, err
 		}
 	default:
@@ -367,6 +387,8 @@ type Sip003Opts struct {
 	Version       string `json:"version"`
 	SNI           string `json:"sni"`
 	AllowInsecure string `json:"allowInsecure"`
+	Username      string `json:"username"` // for jls
+	Alpn          string `json:"alpn"`     // for jls
 }
 
 func ParseSip003Opts(opts string) Sip003Opts {
@@ -394,6 +416,11 @@ func ParseSip003Opts(opts string) Sip003Opts {
 			sip003Opts.Host = a[1]
 		case "password", "passwd", "pwd":
 			sip003Opts.Password = a[1]
+		case "username", "iv":
+			// JLS upstream names the username "iv".
+			sip003Opts.Username = a[1]
+		case "alpn":
+			sip003Opts.Alpn = a[1]
 		case "version", "v":
 			sip003Opts.Version = a[1]
 		case "sni":
@@ -416,6 +443,8 @@ func ParseSip003(plugin string) Sip003 {
 		sip003.Name = "simple-obfs"
 	case "shadowtls", "shadow-tls", "sstls":
 		sip003.Name = "shadow-tls"
+	case "jls":
+		sip003.Name = "jls"
 	default:
 		sip003.Name = fields[0]
 	}
@@ -448,6 +477,12 @@ func (s *Sip003) String() string {
 	}
 	if s.Opts.AllowInsecure != "" {
 		list = append(list, "allowInsecure="+s.Opts.AllowInsecure)
+	}
+	if s.Opts.Username != "" {
+		list = append(list, "username="+s.Opts.Username)
+	}
+	if s.Opts.Alpn != "" {
+		list = append(list, "alpn="+s.Opts.Alpn)
 	}
 	return strings.Join(list, ";")
 }
